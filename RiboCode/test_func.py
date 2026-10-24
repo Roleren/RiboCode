@@ -7,6 +7,7 @@ __author__ = 'Zhengtao Xiao'
 from collections import namedtuple
 import numpy as np
 from scipy import stats
+from scipy import special  # norm.sf(x) == special.ndtr(-x), norm.isf(q) == -special.ndtri(q) (scipy _norm_sf/_norm_isf), without the rv_continuous call overhead
 from scipy.stats import find_repeats,distributions,ttest_1samp
 from statsmodels.stats import multitest
 from minepy import MINE
@@ -77,9 +78,9 @@ def wilcoxon_greater(x, y, zero_method ="wilcox", correction = False):
 	correction = 0.5 * int(bool(correction)) * np.sign(T - mn)
 	z = (T - mn - correction) / se
 	if r_plus > r_minus:
-		prob = distributions.norm.sf(abs(z))
+		prob = special.ndtr(-abs(z))
 	else:
-		prob = 1-distributions.norm.sf(abs(z))
+		prob = 1-special.ndtr(-abs(z))
 
 	return WilcoxonResult(T, prob)
 
@@ -156,13 +157,13 @@ def combine_pvals(pvalues, method="stouffer", adjust="none", R="none"):
 	k = pvs.size
 	
 	if method == "stouffer":
-		statistic = np.sum(stats.norm.isf(pvs)) / np.sqrt(pvs.size)			
+		statistic = np.sum(-special.ndtri(pvs)) / np.sqrt(pvs.size)			
 		if adjust in ["nyholt", "liji", "gao", "galwey"]:
 			m = meff(R,method=adjust)
 			statistic = statistic * np.sqrt( m / k)
 		elif adjust == "generalized":
 			statistic = statistic * np.sqrt(k) / np.sqrt(np.sum(R))
-		comb_pv = stats.norm.sf(statistic)
+		comb_pv = special.ndtr(-statistic)
 	else:
 		raise ValueError("Currently, only stouffer is supported!")
 	return comb_pv

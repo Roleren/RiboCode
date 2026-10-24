@@ -70,7 +70,7 @@ def main():
 				   ALTERNATIVE_START_CODON_LIST=ALTERNATIVE_START_CODON_LIST, STOP_CODON_LIST=STOP_CODON_LIST,
 				   MIN_AA_LENGTH=args.min_AA_length, outname=args.output_name,
 				   output_gtf=output_gtf, output_bed=output_bed, dependence_test=dependence_test,
-				   stouffer_adj = stouffer_adj, pval_adj = pval_adj)
+				   stouffer_adj = stouffer_adj, pval_adj = pval_adj, threads = args.threads)
 
 if __name__ == "__main__":
 	verboseprint("Detecting ORFs ...")

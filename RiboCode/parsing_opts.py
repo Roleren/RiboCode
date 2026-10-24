@@ -164,6 +164,8 @@ def parsing_ribo():
 						help="output the gtf file of predicted ORFs")
 	parser.add_argument("-b","--output-bed",dest="output_bed",action='store_true',default=False,required=False,
 						help="output the bed file of predicted ORFs")
+	parser.add_argument("--threads",dest="threads",default=1,type=int,required=False,
+						help="Number of worker processes for ORF detection (transcripts are split across workers; output is identical). Default: 1.")
 	parser.add_argument("-o","--output-name",dest="output_name",default="final_result",required=False,
 						help="output file name, default: final_result", type=str)
 	parser.add_argument('-V',"--version",action="version",version=__version__)

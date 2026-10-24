@@ -299,9 +299,98 @@ def write_to_bed(gene_dict, transcript_dict, orf_results, collapsed_orf_idx, out
 				if flag:
 					fout2.write("\t".join(map(str,tmp)) + "\n")
 
+# Per-transcript scan, shared by the serial and the parallel path (branch parallel-detect). Shared read-only inputs are
+# module globals so forked workers inherit them without pickling; results are joined in transcript order, so the output
+# is identical to the serial loop.
+_SCAN = {}
+def _scan_transcript(tid):
+	g = _SCAN
+	transcript_dict, tpsites_sum, gene_dict, transcript_seq = g["transcript_dict"], g["tpsites_sum"], g["gene_dict"], g["transcript_seq"]
+	START_CODON, ALTERNATIVE_START_CODON_LIST, STOP_CODON_LIST = g["START_CODON"], g["ALTERNATIVE_START_CODON_LIST"], g["STOP_CODON_LIST"]
+	MIN_AA_LENGTH, only_longest_orf, pval_cutoff, stouffer_adj = g["MIN_AA_LENGTH"], g["only_longest_orf"], g["pval_cutoff"], g["stouffer_adj"]
+	dependence_test, total_psites_number, only_ATG = g["dependence_test"], g["total_psites_number"], g["only_ATG"]
+	PSITE_SUM_CUTOFF = F0_NONZEROS = 5
+
+	tobj = transcript_dict[tid]
+	tpsites = tpsites_sum[tid]
+	gobj = gene_dict[tobj.gene_id]
+	reads_count = tpsites.sum()
+	results = []
+	if tpsites.sum() <PSITE_SUM_CUTOFF:
+		return tid, reads_count, results
+
+	tseq = transcript_seq.get_seq(tobj.transcript_id)
+	commonstop_dict = orf_finder(tseq,START_CODON,ALTERNATIVE_START_CODON_LIST,STOP_CODON_LIST,MIN_AA_LENGTH)
+	candicate_orfivs = start_check(commonstop_dict, only_longest_orf, tpsites, pval_cutoff,stouffer_adj)
+	for orf_iv in candicate_orfivs:
+		if orf_iv.length < MIN_AA_LENGTH * 3:
+			continue
+		orf_psites_array = tpsites[orf_iv.start:orf_iv.end]
+		f0,f1,f2 = extract_frame(orf_psites_array)
+		if f0.sum() < PSITE_SUM_CUTOFF:
+			continue
+		if np.flatnonzero(f0).size < F0_NONZEROS:
+			continue
+		pv1,pv2,pv = test_frame(f0,f1,f2,stouffer_adj=stouffer_adj)
+		if pv <= pval_cutoff:
+			orf_dict = ORF_record(only_ATG)
+			orf_dict["orf_iv"] = orf_iv
+			orf_dict["transcript_id"] = tobj.transcript_id
+			orf_dict["transcript_type"] = tobj.transcript_type
+			orf_dict["gene_id"] = tobj.gene_id
+			orf_dict["gene_name"] = tobj.gene_name
+			orf_dict["gene_type"] = gobj.gene_type
+			orf_dict["chrom"] = tobj.chrom
+			orf_dict["strand"] = tobj.genomic_iv.strand
+			orf_dict["ORF_tstart"] = orf_iv.start + 1 # convert to 1-base
+			orf_dict["ORF_tstop"] = orf_iv.end + 3    # include stop-codon
+			orf_gstart = transcript_pos_transform(tobj, orf_iv.start) + 1 # convert to 1-base
+			orf_gstop = transcript_pos_transform(tobj, orf_iv.end + 2) + 1 # include stop-codon
+			orf_dict["ORF_gstart"] = orf_gstart
+			orf_dict["ORF_gstop"] = orf_gstop
+			if tobj.startcodon is not None:
+				annotated_tstart = tobj.startcodon.start + 1
+				annotated_gstart = transcript_pos_transform(tobj, tobj.startcodon.start) + 1
+			else:
+				annotated_tstart = None
+				annotated_gstart = None
+			if tobj.stopcodon is not None:
+				annotated_tstop = tobj.stopcodon.end
+				annotated_gstop = transcript_pos_transform(tobj, tobj.stopcodon.end - 1) + 1
+			else:
+				annotated_tstop = None
+				annotated_gstop = None
+			orf_dict["annotated_tstart"] = annotated_tstart
+			orf_dict["annotated_tstop"] = annotated_tstop
+			orf_dict["annotated_gstart"] = annotated_gstart
+			orf_dict["annotated_gstop"] = annotated_gstop
+			orf_dict["ORF_ID"] = "%s_%s_%s_%i" % (tobj.gene_id,orf_gstart,orf_gstop,orf_iv.length/3)
+			orf_dict["ORF_length"] = orf_iv.length
+			orf_dict["Psites_sum_frame0"] = f0.sum()
+			orf_dict["Psites_sum_frame1"] = f1.sum()
+			orf_dict["Psites_sum_frame2"] = f2.sum()
+			orf_dict["Psites_coverage_frame0"] = percentage_format(cal_coverage(f0))
+			orf_dict["Psites_coverage_frame1"] = percentage_format(cal_coverage(f1))
+			orf_dict["Psites_coverage_frame2"] = percentage_format(cal_coverage(f2))
+			orf_dict["pval_frame0_vs_frame1"] = pv1.pvalue
+			orf_dict["pval_frame0_vs_frame2"] = pv2.pvalue
+			if dependence_test:
+				orf_dict["dependence_frame1_frame2"] = cal_dependence(f1,f2,dependence_test)
+			orf_dict["pval_combined"] = pv
+			orf_dict["Psites_frame0_RPKM"] = cal_RPKM(orf_dict["Psites_sum_frame0"],orf_iv.length,total_psites_number)
+			orf_seq = transcript_seq.get_seq(tobj.transcript_id,orf_iv.start,orf_iv.end,"+")
+			orf_aaseq = translation(orf_seq,cds=False)
+			orf_dict["AAseq"] = orf_aaseq
+			orf_dict["ORF_type"] = classfy_orf(orf_iv,tobj.cds)
+			if not only_ATG:
+				orf_dict["start_codon"] = orf_seq[:3]
+			results.append(orf_dict)
+	return tid, reads_count, results
+
+
 def main(gene_dict, transcript_dict, annot_dir, tpsites_sum, total_psites_number, pval_cutoff, only_longest_orf,
 		START_CODON, ALTERNATIVE_START_CODON_LIST, STOP_CODON_LIST, MIN_AA_LENGTH, outname, output_gtf, output_bed,
-		dependence_test, stouffer_adj, pval_adj):
+		dependence_test, stouffer_adj, pval_adj, threads=1):
 
 	PSITE_SUM_CUTOFF = F0_NONZEROS = 5
 	transcript_seq = GenomeSeq(os.path.join(annot_dir,"transcripts_sequence.fa"))
@@ -317,86 +406,24 @@ def main(gene_dict, transcript_dict, annot_dir, tpsites_sum, total_psites_number
 	tid_num = len(transcript_dict)
 	counts = 0
 	transcript_reads_count = {}
-	for i,tid in enumerate(transcript_dict.keys()):
-		if i % 1000 == 0:
-			sys.stderr.write(percentage_format(i / tid_num, decimal=0) + " has finished! \r")
+	_SCAN.update(dict(transcript_dict=transcript_dict, tpsites_sum=tpsites_sum, gene_dict=gene_dict, transcript_seq=transcript_seq,
+		START_CODON=START_CODON, ALTERNATIVE_START_CODON_LIST=ALTERNATIVE_START_CODON_LIST, STOP_CODON_LIST=STOP_CODON_LIST,
+		MIN_AA_LENGTH=MIN_AA_LENGTH, only_longest_orf=only_longest_orf, pval_cutoff=pval_cutoff, stouffer_adj=stouffer_adj,
+		dependence_test=dependence_test, total_psites_number=total_psites_number, only_ATG=only_ATG))
+	tids = list(transcript_dict.keys())
+	if threads > 1:
+		import multiprocessing as mp
+		with mp.get_context("fork").Pool(threads) as pool:
+			scanned = pool.map(_scan_transcript, tids, chunksize=max(1, len(tids) // (threads * 20)))
+	else:
+		scanned = map(_scan_transcript, tids)
+	for tid, reads_count, results in scanned:
+		transcript_reads_count[tid] = reads_count
+		for orf_dict in results:
+			orf_results.append(orf_dict)
+			transcript_orf_hash[tid].append(counts)
+			counts += 1
 
-		tobj = transcript_dict[tid]
-		tpsites = tpsites_sum[tid]
-		gobj = gene_dict[tobj.gene_id]
-		transcript_reads_count[tid] = tpsites.sum()
-		if tpsites.sum() <PSITE_SUM_CUTOFF:
-			continue
-
-		tseq = transcript_seq.get_seq(tobj.transcript_id)
-		commonstop_dict = orf_finder(tseq,START_CODON,ALTERNATIVE_START_CODON_LIST,STOP_CODON_LIST,MIN_AA_LENGTH)
-		candicate_orfivs = start_check(commonstop_dict, only_longest_orf, tpsites, pval_cutoff,stouffer_adj)
-		for orf_iv in candicate_orfivs:
-			if orf_iv.length < MIN_AA_LENGTH * 3:
-				continue
-			orf_psites_array = tpsites[orf_iv.start:orf_iv.end]
-			f0,f1,f2 = extract_frame(orf_psites_array)
-			if f0.sum() < PSITE_SUM_CUTOFF:
-				continue
-			if np.flatnonzero(f0).size < F0_NONZEROS:
-				continue
-			pv1,pv2,pv = test_frame(f0,f1,f2,stouffer_adj=stouffer_adj)
-			if pv <= pval_cutoff:
-				orf_dict = ORF_record(only_ATG)
-				orf_dict["orf_iv"] = orf_iv
-				orf_dict["transcript_id"] = tobj.transcript_id
-				orf_dict["transcript_type"] = tobj.transcript_type
-				orf_dict["gene_id"] = tobj.gene_id
-				orf_dict["gene_name"] = tobj.gene_name
-				orf_dict["gene_type"] = gobj.gene_type
-				orf_dict["chrom"] = tobj.chrom
-				orf_dict["strand"] = tobj.genomic_iv.strand
-				orf_dict["ORF_tstart"] = orf_iv.start + 1 # convert to 1-base
-				orf_dict["ORF_tstop"] = orf_iv.end + 3    # include stop-codon
-				orf_gstart = transcript_pos_transform(tobj, orf_iv.start) + 1 # convert to 1-base
-				orf_gstop = transcript_pos_transform(tobj, orf_iv.end + 2) + 1 # include stop-codon
-				orf_dict["ORF_gstart"] = orf_gstart
-				orf_dict["ORF_gstop"] = orf_gstop
-				if tobj.startcodon is not None:
-					annotated_tstart = tobj.startcodon.start + 1
-					annotated_gstart = transcript_pos_transform(tobj, tobj.startcodon.start) + 1
-				else:
-					annotated_tstart = None
-					annotated_gstart = None
-				if tobj.stopcodon is not None:
-					annotated_tstop = tobj.stopcodon.end
-					annotated_gstop = transcript_pos_transform(tobj, tobj.stopcodon.end - 1) + 1
-				else:
-					annotated_tstop = None
-					annotated_gstop = None
-				orf_dict["annotated_tstart"] = annotated_tstart
-				orf_dict["annotated_tstop"] = annotated_tstop
-				orf_dict["annotated_gstart"] = annotated_gstart
-				orf_dict["annotated_gstop"] = annotated_gstop
-				orf_dict["ORF_ID"] = "%s_%s_%s_%i" % (tobj.gene_id,orf_gstart,orf_gstop,orf_iv.length/3)
-				orf_dict["ORF_length"] = orf_iv.length
-				orf_dict["Psites_sum_frame0"] = f0.sum()
-				orf_dict["Psites_sum_frame1"] = f1.sum()
-				orf_dict["Psites_sum_frame2"] = f2.sum()
-				orf_dict["Psites_coverage_frame0"] = percentage_format(cal_coverage(f0))
-				orf_dict["Psites_coverage_frame1"] = percentage_format(cal_coverage(f1))
-				orf_dict["Psites_coverage_frame2"] = percentage_format(cal_coverage(f2))
-				orf_dict["pval_frame0_vs_frame1"] = pv1.pvalue
-				orf_dict["pval_frame0_vs_frame2"] = pv2.pvalue
-				if dependence_test:
-					orf_dict["dependence_frame1_frame2"] = cal_dependence(f1,f2,dependence_test)
-				orf_dict["pval_combined"] = pv
-				orf_dict["Psites_frame0_RPKM"] = cal_RPKM(orf_dict["Psites_sum_frame0"],orf_iv.length,total_psites_number)
-				orf_seq = transcript_seq.get_seq(tobj.transcript_id,orf_iv.start,orf_iv.end,"+")
-				orf_aaseq = translation(orf_seq,cds=False)
-				orf_dict["AAseq"] = orf_aaseq
-				orf_dict["ORF_type"] = classfy_orf(orf_iv,tobj.cds)
-				if not only_ATG:
-					orf_dict["start_codon"] = orf_seq[:3]
-				orf_results.append(orf_dict)
-				transcript_orf_hash[tid].append(counts)
-				counts += 1
-	
 	if len(orf_results) == 0:
 		sys.stderr.write("Opps, no translated ORFs were detected.\n")
 
